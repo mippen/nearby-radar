@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Nearby Radar</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    :root {
+      --bg:#0b111a; --panel:#111927; --border:#223047; --text:#e2e8f0; --muted:#8b9bb4;
+      --heli:#f59e0b; --plane:#38bdf8; --aprs:#22c55e; --mesh:#c084fc;
+    }
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body {
+      font-family: system-ui, sans-serif; background:var(--bg); color:var(--text);
+      height:100vh; display:flex; flex-direction:column; overflow:hidden;
+    }
+    #map { flex:1; width:100%; background:#090e16; }
+    .drawer {
+      background:var(--panel); border-top:1px solid var(--border);
+      padding:10px 12px; display:flex; flex-direction:column; gap:8px; max-height:42vh;
+    }
+    .row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+    button {
+      background:#1e293b; color:var(--text); border:1px solid var(--border);
+      padding:6px 10px; border-radius:6px; font-size:12px;
+    }
+    input[type="range"] { flex:1; accent-color:var(--plane); }
+    .toggles { display:grid; grid-template-columns:repeat(4,1fr); gap:5px; }
+    .toggle-btn {
+      display:flex; flex-direction:column; align-items:center; padding:5px 4px;
+      border-radius:6px; border:1px solid var(--border); background:#0e1623; font-size:11px;
+    }
+    .toggle-btn.off { opacity:0.4; }
+    .list { overflow-y:auto; flex:1; }
+    .item {
+      display:flex; justify-content:space-between; padding:6px 4px;
+      border-bottom:1px solid #1a2436; font-size:12px;
+    }
+    .leaflet-popup-content-wrapper, .leaflet-popup-tip {
+      background:#111927; color:#e2e8f0; border:1px solid #223047;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="drawer">
+    <div class="row">
+      <button onclick="AndroidRadar.requestLocation()">GPS</button>
+      <input id="radiusSlider" type="range" min="10" max="250" step="5" value="80" />
+      <strong id="radiusLabel" style="font-size:12px; min-width:52px; text-align:right;">80 km</strong>
+    </div>
+    <div class="toggles">
+      <div class="toggle-btn" data-layer="heli"><span style="color:var(--heli)">Helis</span><strong id="c-heli">0</strong></div>
+      <div class="toggle-btn" data-layer="plane"><span style="color:var(--plane)">Flights</span><strong id="c-plane">0</strong></div>
+      <div class="toggle-btn" data-layer="aprs"><span style="color:var(--aprs)">APRS</span><strong id="c-aprs">0</strong></div>
+      <div class="toggle-btn" data-layer="mesh"><span style="color:var(--mesh)">Mesh</span><strong id="c-mesh">0</strong></div>
+    </div>
+    <div class="list" id="entityList"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    let center = { lat: 59.3293, lon: 18.0686 };
+    let radiusKm = 80;
+    const enabled = { heli: true, plane: true, aprs: true, mesh: true };
+    const store = { aircraft: [], aprs: [], mesh: [] };
+    const markers = new Map();
+
+    const map = L.map("map", { zoomControl: false }).setView([center.lat, center.lon], 9);
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { maxZoom: 19 }).addTo(map);
+
+    const layers = {
+      heli: L.layerGroup().addTo(map),
+      plane: L.layerGroup().addTo(map),
+      aprs: L.layerGroup().addTo(map),
+      mesh: L.layerGroup().addTo(map),
+    };
+    const pin = L.circleMarker([center.lat, center.lon], { radius: 5, color: "#fff", fillColor: "#38bdf8", fillOpacity: 1 }).addTo(map);
+    const circle = L.circle([center.lat, center.lon], { radius: radiusKm * 1000, color: "#38bdf8", weight: 1, fillOpacity: 0.04, interactive: false }).addTo(map);
+
+    function planeIcon(track) {
+      return L.divIcon({
+        className: "", iconSize: [22, 22], iconAnchor: [11, 11],
+        html: `<svg viewBox="0 0 24 24" width="20" height="20" style="transform:rotate(${track||0}deg)"><path fill="#38bdf8" d="M21 16v-2l-8-5V3.5a1.5 1.5 0 0 0-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/></svg>`
+      });
+    }
+    function dotIcon(color) {
+      return L.divIcon({
+        className: "", iconSize: [14, 14], iconAnchor: [7, 7],
+        html: `<div style="width:12px;height:12px;border-radius:50%;background:${color};border:2px solid #0b111a"></div>`
+      });
+    }
+
+    function setCenter(lat, lon, pan) {
+      center = { lat, lon };
+      pin.setLatLng([lat, lon]);
+      circle.setLatLng([lat, lon]);
+      circle.setRadius(radiusKm * 1000);
+      if (pan) map.setView([lat, lon], Math.max(map.getZoom(), 10));
+      fetchAll();
+    }
+    window.setCenterFromNative = (lat, lon) => setCenter(lat, lon, true);
+
+    map.on("click", (e) => setCenter(e.latlng.lat, e.latlng.lng, false));
+
+    const slider = document.getElementById("radiusSlider");
+    slider.addEventListener("input", (e) => {
+      radiusKm = Number(e.target.value);
+      document.getElementById("radiusLabel").textContent = `${radiusKm} km`;
+      circle.setRadius(radiusKm * 1000);
+    });
+    slider.addEventListener("change", fetchAll);
+
+    document.querySelectorAll(".toggle-btn").forEach((b) => {
+      b.addEventListener("click", () => {
+        const k = b.dataset.layer;
+        enabled[k] = !enabled[k];
+        b.classList.toggle("off", !enabled[k]);
+        if (enabled[k]) map.addLayer(layers[k]); else map.removeLayer(layers[k]);
+        renderList();
+      });
+    });
+
+    window.onFlightsData = (data) => {
+      store.aircraft = data.aircraft || [];
+      layers.heli.clearLayers();
+      layers.plane.clearLayers();
+      let h = 0, p = 0;
+      for (const ac of store.aircraft) {
+        const popup = `<strong>${ac.callsign}</strong> (${ac.type || "?"})<br>${ac.on_ground ? "Ground" : (ac.alt_ft ?? "?") + " ft"} • ${ac.distance_km} km`;
+        if (ac.is_helicopter) {
+          h++;
+          const m = L.marker([ac.lat, ac.lon], { icon: dotIcon("#f59e0b") }).bindPopup("Heli: " + popup).addTo(layers.heli);
+          markers.set("ac-" + ac.hex, m);
+        } else {
+          p++;
+          const m = L.marker([ac.lat, ac.lon], { icon: planeIcon(ac.track) }).bindPopup("Flight: " + popup).addTo(layers.plane);
+          markers.set("ac-" + ac.hex, m);
+        }
+      }
+      document.getElementById("c-heli").textContent = h;
+      document.getElementById("c-plane").textContent = p;
+      renderList();
+    };
+
+    window.onAprsData = (data) => {
+      store.aprs = data.stations || [];
+      layers.aprs.clearLayers();
+      for (const st of store.aprs) {
+        const m = L.marker([st.lat, st.lon], { icon: dotIcon("#22c55e") })
+          .bindPopup(`<strong>APRS: ${st.callsign}</strong><br>${st.comment || st.symbol}<br>${st.distance_km} km`)
+          .addTo(layers.aprs);
+        markers.set("aprs-" + st.callsign, m);
+      }
+      document.getElementById("c-aprs").textContent = store.aprs.length;
+      renderList();
+    };
+
+    window.onMeshData = (data) => {
+      store.mesh = data.devices || [];
+      layers.mesh.clearLayers();
+      for (const d of store.mesh) {
+        const m = L.marker([d.lat, d.lon], { icon: dotIcon("#c084fc") })
+          .bindPopup(`<strong>MeshCore ${d.role}</strong><br>${d.name}<br>${d.distance_km} km`)
+          .addTo(layers.mesh);
+        markers.set("mesh-" + (d.id || d.name), m);
+      }
+      document.getElementById("c-mesh").textContent = store.mesh.length;
+      renderList();
+    };
+
+    function renderList() {
+      const items = [];
+      for (const ac of store.aircraft) {
+        const k = ac.is_helicopter ? "heli" : "plane";
+        if (!enabled[k]) continue;
+        items.push({ key: "ac-" + ac.hex, lat: ac.lat, lon: ac.lon, title: ac.callsign, sub: ac.is_helicopter ? "Heli" : "Flight", dist: ac.distance_km, color: ac.is_helicopter ? "var(--heli)" : "var(--plane)" });
+      }
+      if (enabled.aprs) for (const st of store.aprs) items.push({ key: "aprs-" + st.callsign, lat: st.lat, lon: st.lon, title: st.callsign, sub: "APRS", dist: st.distance_km, color: "var(--aprs)" });
+      if (enabled.mesh) for (const d of store.mesh) items.push({ key: "mesh-" + (d.id || d.name), lat: d.lat, lon: d.lon, title: d.name, sub: d.role, dist: d.distance_km, color: "var(--mesh)" });
+      items.sort((a, b) => a.dist - b.dist);
+
+      const el = document.getElementById("entityList");
+      el.innerHTML = items.slice(0, 80).map(i =>
+        `<div class="item" onclick="focusItem('${i.key}',${i.lat},${i.lon})">
+          <span style="color:${i.color}"><strong>${i.title}</strong> <span style="color:var(--muted)">(${i.sub})</span></span>
+          <span style="color:var(--muted)">${i.dist} km</span>
+        </div>`
+      ).join("");
+    }
+
+    window.focusItem = (k, lat, lon) => {
+      map.flyTo([lat, lon], 12);
+      const m = markers.get(k);
+      if (m) m.openPopup();
+    };
+
+    function fetchAll() {
+      if (!window.AndroidRadar) return;
+      AndroidRadar.fetchFlights(center.lat, center.lon, radiusKm);
+      AndroidRadar.fetchAprs(center.lat, center.lon, radiusKm);
+      AndroidRadar.fetchMeshcore(center.lat, center.lon, radiusKm);
+    }
+
+    fetchAll();
+    setInterval(() => AndroidRadar?.fetchFlights(center.lat, center.lon, radiusKm), 6000);
+    setInterval(() => AndroidRadar?.fetchAprs(center.lat, center.lon, radiusKm), 10000);
+    setInterval(() => AndroidRadar?.fetchMeshcore(center.lat, center.lon, radiusKm), 60000);
+  </script>
+</body>
+</html>
